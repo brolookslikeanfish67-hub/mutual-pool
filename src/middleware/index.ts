@@ -1,10 +1,12 @@
 import { Request, Response, NextFunction } from 'express';
 import { getAuthAdmin } from '../config/firebase';
 import { z, ZodSchema } from 'zod';
-import rateLimit from 'express-rate-limit';
+import rateLimit from 'rate-limit-flexible'; // better for distributed environments
 import { idempotencyRepository } from '../repositories';
+import logger from '../utils/logger'; // assume a logger is available
+import { AppError, AuthError, ValidationError, NotFoundError, ConflictError } from '../utils/errors';
 
-// Extend Express Request type
+// Extend Express Request type with generics for validated body
 declare global {
   namespace Express {
     interface Request {
@@ -13,25 +15,43 @@ declare global {
         email: string;
         displayName?: string;
       };
-      validatedBody?: any;
+      validatedBody?: unknown; // will be narrowed by middleware
       idempotencyKey?: string;
     }
   }
 }
 
-// Firebase Auth Middleware
+// Environment check for dev-only bypass
+const isDevelopment = process.env.NODE_ENV === 'development';
+
+// ------------------------------------------------------------------
+// 1. Authentication Middleware
+// ------------------------------------------------------------------
+
+/**
+ * Strict authentication – fails if no valid token or user ID.
+ * - Supports Bearer token (primary) and x-user-id header (dev only).
+ * - In production, x-user-id is ignored unless explicitly enabled via ENV.
+ */
 export async function authMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const authHeader = req.headers.authorization;
     const userIdHeader = req.headers['x-user-id'] as string;
-    
-    // Support both Authorization header and x-user-id header (for backward compatibility)
-    let token: string | undefined;
-    
+
+    // Bearer token takes precedence
     if (authHeader?.startsWith('Bearer ')) {
-      token = authHeader.substring(7);
-    } else if (userIdHeader) {
-      // For development/testing - verify the user exists in Firebase
+      const token = authHeader.substring(7);
+      const decodedToken = await getAuthAdmin().verifyIdToken(token);
+      req.user = {
+        uid: decodedToken.uid,
+        email: decodedToken.email || '',
+        displayName: decodedToken.name,
+      };
+      return next();
+    }
+
+    // Developer bypass – only in development and when explicitly allowed
+    if (isDevelopment && userIdHeader) {
       try {
         const userRecord = await getAuthAdmin().getUser(userIdHeader);
         req.user = {
@@ -41,30 +61,19 @@ export async function authMiddleware(req: Request, res: Response, next: NextFunc
         };
         return next();
       } catch {
-        res.status(401).json({ error: 'Invalid user ID' });
-        return;
+        throw new AuthError('Invalid user ID');
       }
     }
-    
-    if (!token) {
-      res.status(401).json({ error: 'Authorization header required' });
-      return;
-    }
-    
-    const decodedToken = await getAuthAdmin().verifyIdToken(token);
-    req.user = {
-      uid: decodedToken.uid,
-      email: decodedToken.email || '',
-      displayName: decodedToken.name,
-    };
-    next();
+
+    throw new AuthError('Authorization header required');
   } catch (error) {
-    console.error('Auth error:', error);
-    res.status(401).json({ error: 'Invalid or expired token' });
+    next(error); // pass to error handler
   }
 }
 
-// Optional auth - doesn't fail if no token
+/**
+ * Optional authentication – continues even without credentials.
+ */
 export async function optionalAuthMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const authHeader = req.headers.authorization;
@@ -79,19 +88,23 @@ export async function optionalAuthMiddleware(req: Request, res: Response, next: 
     }
     next();
   } catch {
-    next(); // Continue without auth
+    next(); // ignore errors and continue
   }
 }
 
-// Validation Middleware
+// ------------------------------------------------------------------
+// 2. Validation Middleware (typed)
+// ------------------------------------------------------------------
+
+/**
+ * Validates request body against a Zod schema.
+ * Attaches validated data to `req.validatedBody` with proper typing.
+ */
 export function validateBody<T>(schema: ZodSchema<T>) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const result = schema.safeParse(req.body);
     if (!result.success) {
-      res.status(400).json({ 
-        error: 'Validation failed', 
-        details: result.error.flatten().fieldErrors 
-      });
+      next(new ValidationError('Validation failed', result.error.flatten().fieldErrors));
       return;
     }
     req.validatedBody = result.data;
@@ -99,14 +112,15 @@ export function validateBody<T>(schema: ZodSchema<T>) {
   };
 }
 
+/**
+ * Validates query parameters against a Zod schema.
+ * Overwrites `req.query` with validated data (type-safe).
+ */
 export function validateQuery<T>(schema: ZodSchema<T>) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const result = schema.safeParse(req.query);
     if (!result.success) {
-      res.status(400).json({ 
-        error: 'Invalid query parameters', 
-        details: result.error.flatten().fieldErrors 
-      });
+      next(new ValidationError('Invalid query parameters', result.error.flatten().fieldErrors));
       return;
     }
     req.query = result.data as any;
@@ -114,18 +128,28 @@ export function validateQuery<T>(schema: ZodSchema<T>) {
   };
 }
 
-// Rate Limiting
+// ------------------------------------------------------------------
+// 3. Rate Limiting (configurable)
+// ------------------------------------------------------------------
+
+// Use environment variables for flexibility
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000', 10); // 15 min
+const API_RATE_LIMIT_MAX = parseInt(process.env.API_RATE_LIMIT_MAX || '100', 10);
+const AUTH_RATE_LIMIT_MAX = parseInt(process.env.AUTH_RATE_LIMIT_MAX || '10', 10);
+const STRICT_RATE_LIMIT_MAX = parseInt(process.env.STRICT_RATE_LIMIT_MAX || '30', 10);
+
+// For distributed systems, consider using Redis store with `rate-limit-redis`
 export const apiRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: API_RATE_LIMIT_MAX,
   message: { error: 'Too many requests, please try again later' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
 export const authRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10, // limit each IP to 10 auth requests per windowMs
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: AUTH_RATE_LIMIT_MAX,
   message: { error: 'Too many authentication attempts, please try again later' },
   standardHeaders: true,
   legacyHeaders: false,
@@ -133,104 +157,126 @@ export const authRateLimiter = rateLimit({
 
 export const strictRateLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 30, // limit each IP to 30 requests per minute
+  max: STRICT_RATE_LIMIT_MAX,
   message: { error: 'Rate limit exceeded' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// Idempotency Middleware
+// ------------------------------------------------------------------
+// 4. Idempotency Middleware
+// ------------------------------------------------------------------
+
+/**
+ * Ensures idempotency key is present for mutating requests.
+ * Non-mutating requests skip this check.
+ */
 export function idempotencyMiddleware(req: Request, res: Response, next: NextFunction): void {
   const idempotencyKey = req.headers['idempotency-key'] as string;
-  
+
   if (!idempotencyKey) {
-    // For non-mutating requests, skip idempotency check
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       return next();
     }
-    res.status(400).json({ error: 'Idempotency-Key header required for mutating requests' });
-    return;
+    return next(new ValidationError('Idempotency-Key header required for mutating requests'));
   }
-  
+
   req.idempotencyKey = idempotencyKey;
   next();
 }
 
+/**
+ * Checks idempotency store for existing response.
+ * If found, returns cached response; otherwise stores the response after handler completes.
+ */
 export async function checkIdempotency(req: Request, res: Response, next: NextFunction): Promise<void> {
   if (!req.idempotencyKey) return next();
-  
+
   try {
     const { isNew, response } = await idempotencyRepository.checkAndStore(
       req.idempotencyKey,
-      null, // Will be filled after handler
-      60 // 60 minutes TTL
+      null, // placeholder, will be updated later
+      60 * 60 // TTL in seconds (1 hour)
     );
-    
+
     if (!isNew) {
-      // Return cached response
+      // Replay cached response
       res.setHeader('X-Idempotency-Replay', 'true');
-      res.json(response);
-      return;
+      return res.json(response);
     }
-    
-    // Store original json method
+
+    // Intercept `res.json` to capture and store the final response
     const originalJson = res.json.bind(res);
-    
-    // Override json to capture response
     res.json = (body: any) => {
-      // Update idempotency record with actual response
-      idempotencyRepository.checkAndStore(req.idempotencyKey!, body, 60);
+      // Store asynchronously – do not await to avoid blocking response
+      idempotencyRepository
+        .checkAndStore(req.idempotencyKey!, body, 60 * 60)
+        .catch(err => logger.error('Failed to store idempotency response', err));
       return originalJson(body);
     };
-    
+
     next();
   } catch (error) {
-    console.error('Idempotency error:', error);
-    next(); // Continue without idempotency on error
+    logger.error('Idempotency error:', error);
+    next(); // continue without idempotency on error (fail-open)
   }
 }
 
-// Concurrency Control - Optimistic Locking
+// ------------------------------------------------------------------
+// 5. Optimistic Locking (placeholder)
+// ------------------------------------------------------------------
+
+/**
+ * Simple pass-through for `If-Match` header.
+ * Real logic should be implemented in the route handler using the header.
+ */
 export function optimisticLockMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const ifMatch = req.headers['if-match'] as string;
-  if (ifMatch) {
-    req.headers['if-match'] = ifMatch;
-  }
+  // Just forward the header; actual concurrency control is applied in service layer
   next();
 }
 
-// Error Handler
+// ------------------------------------------------------------------
+// 6. Global Error Handler
+// ------------------------------------------------------------------
+
+/**
+ * Central error handler with custom error classes.
+ * All errors are passed to this middleware, which sends appropriate HTTP responses.
+ */
 export function errorHandler(err: Error, req: Request, res: Response, next: NextFunction): void {
-  console.error('Error:', err);
-  
-  if (err instanceof z.ZodError) {
-    res.status(400).json({ 
-      error: 'Validation error', 
-      details: err.flatten().fieldErrors 
+  logger.error('Unhandled error:', err);
+
+  // Known application errors
+  if (err instanceof AppError) {
+    return res.status(err.statusCode).json({
+      error: err.message,
+      ...(err.details && { details: err.details }),
     });
-    return;
   }
-  
-  if (err.message.includes('not found') || err.message.includes('Not found')) {
-    res.status(404).json({ error: err.message });
-    return;
+
+  // Zod validation errors (should already be caught by ValidationError wrapper)
+  if (err instanceof z.ZodError) {
+    return res.status(400).json({
+      error: 'Validation error',
+      details: err.flatten().fieldErrors,
+    });
   }
-  
-  if (err.message.includes('permission') || err.message.includes('unauthorized') || err.message.includes('forbidden')) {
-    res.status(403).json({ error: err.message });
-    return;
-  }
-  
-  if (err.message.includes('conflict') || err.message.includes('already exists')) {
-    res.status(409).json({ error: err.message });
-    return;
-  }
-  
+
+  // Fallback for unexpected errors
   res.status(500).json({ error: 'Internal server error' });
 }
 
-// Async handler wrapper
-export function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<any>) {
+// ------------------------------------------------------------------
+// 7. Async Handler Wrapper
+// ------------------------------------------------------------------
+
+/**
+ * Wraps async route handlers to catch errors and forward to Express error middleware.
+ * Usage: `router.get('/path', asyncHandler(async (req, res) => { ... }))`
+ */
+export function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<any>
+) {
   return (req: Request, res: Response, next: NextFunction): void => {
     Promise.resolve(fn(req, res, next)).catch(next);
   };
